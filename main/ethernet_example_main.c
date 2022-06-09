@@ -30,6 +30,7 @@ char *url_link = "http:/test/test";
 
 static const char *TAG = "eth_example";
 static esp_eth_handle_t s_eth_handle = NULL;
+static esp_eth_handle_t s_eth_handle_1 = NULL;
 static xQueueHandle flow_control_queue = NULL;
 static bool s_sta_is_connected = false;
 static bool s_ethernet_is_connected = false;
@@ -248,25 +249,29 @@ static void initialize_ethernet(void)
 #endif
 #endif // CONFIG_ETH_USE_SPI_ETHERNET
     esp_eth_config_t config = ETH_DEFAULT_CONFIG(mac, phy);
+    esp_eth_config_t config_1 = ETH_DEFAULT_CONFIG(mac, phy);
      config.stack_input = pkt_eth2wifi;
     ESP_ERROR_CHECK(esp_eth_driver_install(&config, &s_eth_handle));
+     ESP_ERROR_CHECK(esp_eth_driver_install(&config_1, &s_eth_handle_1));
 #if !CONFIG_EXAMPLE_USE_INTERNAL_ETHERNET
     /* The SPI Ethernet module might doesn't have a burned factory MAC address, we cat to set it manually.
        02:00:00 is a Locally Administered OUI range so should not be used except when testing on a LAN under your control.
     */
     ESP_ERROR_CHECK(esp_eth_ioctl(s_eth_handle, ETH_CMD_S_MAC_ADDR, (uint8_t[]){0x02, 0x00, 0x00, 0x12, 0x34, 0x56}));
+     ESP_ERROR_CHECK(esp_eth_ioctl(s_eth_handle_1, ETH_CMD_S_MAC_ADDR, (uint8_t[]){0x02, 0x00, 0x00, 0x12, 0x34, 0x59}));
 #endif
     esp_eth_ioctl(s_eth_handle, ETH_CMD_S_PROMISCUOUS, (void *)true);
-    // esp_eth_start(s_eth_handle);
+    esp_eth_ioctl(s_eth_handle_1, ETH_CMD_S_PROMISCUOUS, (void *)true);
+     esp_eth_start(s_eth_handle);
 
     /**dummmy*/
     esp_netif_init(); // Initialize TCP/IP network interface (should be called only once in application)
     esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH(); // apply default network interface configuration for Ethernet
     esp_netif_t *eth_netif = esp_netif_new(&cfg);     // create network interface for Ethernet driver
 
-    esp_netif_attach(eth_netif, esp_eth_new_netif_glue(s_eth_handle));                   // attach Ethernet driver to TCP/IP stack
+    esp_netif_attach(eth_netif, esp_eth_new_netif_glue(s_eth_handle_1));                   // attach Ethernet driver to TCP/IP stack
     esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler, NULL); // register user defined IP event handlers
-    esp_eth_start(s_eth_handle);                                                            // start Ethernet driver state machine
+    esp_eth_start(s_eth_handle_1);                                                            // start Ethernet driver state machine
 }
 
 static void initialize_wifi(void)
