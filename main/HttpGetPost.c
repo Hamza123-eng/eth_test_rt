@@ -49,9 +49,9 @@ bool HttpGet(char *URL, char *buffer, int buffer_size, char *authentication_toke
                 if (data_read > 0)
                 {
                     ESP_LOGD(TAG, "HTTP_DATA........%s", buffer);
-                    ESP_LOGD(TAG, "HTTP GET Status = %d, content_length = %lld",
-                             esp_http_client_get_status_code(client),
-                             esp_http_client_get_content_length(client));
+                    // ESP_LOGD(TAG, "HTTP GET Status = %d, content_length = %lld",
+                    //          esp_http_client_get_status_code(client),
+                    //          esp_http_client_get_content_length(client));
                     flag = 1;
                     // ESP_LOG_BUFFER_HEX(TAG, output_buffer, data_read);
                 }
@@ -121,9 +121,9 @@ bool HttpPost(char *URL, char *buffer, int buffer_size, char *authentication_tok
                 if (data_read >= 0)
                 {
 
-                    ESP_LOGI(TAG, "HTTP POST Status = %d, content_length = %lld",
-                             esp_http_client_get_status_code(client),
-                             esp_http_client_get_content_length(client));
+                    // ESP_LOGI(TAG, "HTTP POST Status = %d, content_length = %lld",
+                    //          esp_http_client_get_status_code(client),
+                    //          esp_http_client_get_content_length(client));
 
                     if (esp_http_client_get_status_code(client) == 200)
                         flag = 1;

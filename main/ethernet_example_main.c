@@ -96,6 +96,35 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
     ESP_LOGI(TAG, "~~~~~~~~~~~");
 }
 
+static void eth2wifi_flow_control_task(void *args)
+{
+    flow_control_msg_t msg;
+    int res = 0;
+    uint32_t timeout = 0;
+    while (1)
+    {
+        if (xQueueReceive(flow_control_queue, &msg, pdMS_TO_TICKS(FLOW_CONTROL_QUEUE_TIMEOUT_MS)) == pdTRUE)
+        {
+            timeout = 0;
+            if (s_sta_is_connected && msg.length)
+            {
+                do
+                {
+                    vTaskDelay(pdMS_TO_TICKS(timeout));
+                    timeout += 2;
+                    res = esp_wifi_internal_tx(WIFI_IF_AP, msg.packet, msg.length);
+                } while (res && timeout < FLOW_CONTROL_WIFI_SEND_TIMEOUT_MS);
+                if (res != ESP_OK)
+                {
+                    ESP_LOGE(TAG, "WiFi send packet failed: %d", res);
+                }
+            }
+            free(msg.packet);
+        }
+    }
+    vTaskDelete(NULL);
+}
+
 // Event handler for Ethernet
 static void eth_event_handler(void *arg, esp_event_base_t event_base,
                               int32_t event_id, void *event_data)
@@ -219,7 +248,7 @@ static void initialize_ethernet(void)
 #endif
 #endif // CONFIG_ETH_USE_SPI_ETHERNET
     esp_eth_config_t config = ETH_DEFAULT_CONFIG(mac, phy);
-    // config.stack_input = pkt_eth2wifi;
+     config.stack_input = pkt_eth2wifi;
     ESP_ERROR_CHECK(esp_eth_driver_install(&config, &s_eth_handle));
 #if !CONFIG_EXAMPLE_USE_INTERNAL_ETHERNET
     /* The SPI Ethernet module might doesn't have a burned factory MAC address, we cat to set it manually.
@@ -266,18 +295,18 @@ static void initialize_wifi(void)
 
 static esp_err_t initialize_flow_control(void)
 {
-//     flow_control_queue = xQueueCreate(FLOW_CONTROL_QUEUE_LENGTH, sizeof(flow_control_msg_t));
-//     if (!flow_control_queue)
-//     {
-//         ESP_LOGE(TAG, "create flow control queue failed");
-//         return ESP_FAIL;
-//     }
-//   //  BaseType_t ret = xTaskCreate(eth2wifi_flow_control_task, "flow_ctl", 2048, NULL, (tskIDLE_PRIORITY + 2), NULL);
-//     if (ret != pdTRUE)
-//     {
-//         ESP_LOGE(TAG, "create flow control task failed");
-//         return ESP_FAIL;
-//     }
+    flow_control_queue = xQueueCreate(FLOW_CONTROL_QUEUE_LENGTH, sizeof(flow_control_msg_t));
+    if (!flow_control_queue)
+    {
+        ESP_LOGE(TAG, "create flow control queue failed");
+        return ESP_FAIL;
+    }
+    BaseType_t ret = xTaskCreate(eth2wifi_flow_control_task, "flow_ctl", 2048, NULL, (tskIDLE_PRIORITY + 2), NULL);
+    if (ret != pdTRUE)
+    {
+        ESP_LOGE(TAG, "create flow control task failed");
+        return ESP_FAIL;
+    }
    return ESP_OK;
 }
 
@@ -316,7 +345,8 @@ void app_main(void)
     gpio_set_level(ETH_POWER_PIN, 1);
 
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    // ESP_ERROR_CHECK(initialize_flow_control());
+    ESP_ERROR_CHECK(initialize_flow_control());
+    initialize_wifi();
     initialize_ethernet();
     xTaskCreate(
         eth_test,   /* Function that implements the task. */
