@@ -16,45 +16,64 @@
 #include "esp_log.h"
 #include "esp_eth.h"
 #include "esp_wifi.h"
+#include "HttpGetPost.h"
 #include "nvs_flash.h"
 #include "esp_private/wifi.h"
 #include "driver/gpio.h"
-#include "HttpGetPost.h"
 #if CONFIG_ETH_USE_SPI_ETHERNET
 #include "driver/spi_master.h"
 #endif
 
-char data_buffer[1024 * 2];
-
 char *url_link = "http:/test/test";
+
+char data_buffer[1024 * 2];
 
 static const char *TAG = "eth_example";
 static esp_eth_handle_t s_eth_handle = NULL;
-static esp_eth_handle_t s_eth_handle_1 = NULL;
 static xQueueHandle flow_control_queue = NULL;
 static bool s_sta_is_connected = false;
 static bool s_ethernet_is_connected = false;
 static uint8_t s_eth_mac[6];
-
+static esp_netif_t *ap_netif = NULL;
 #define FLOW_CONTROL_QUEUE_TIMEOUT_MS (100)
 #define FLOW_CONTROL_QUEUE_LENGTH (40)
 #define FLOW_CONTROL_WIFI_SEND_TIMEOUT_MS (100)
+static SemaphoreHandle_t s_send_mutex = NULL;
 
-#define ETH_POWER_PIN 4
-
-typedef struct
-{
+typedef struct {
     void *packet;
     uint16_t length;
 } flow_control_msg_t;
 
+static void copy_packet_to_network(void *buffer, uint16_t len)
+{
+    if (!ap_netif)
+        return;
+    const uint8_t s_broadcast_address[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+    const uint8_t s_no_address[6] = { 0, 0, 0, 0, 0, 0 };
+    uint8_t* eth_mac = buffer;
+    if (memcmp(eth_mac, s_broadcast_address, 6) == 0 ||
+        memcmp(eth_mac, s_eth_mac, 6) == 0 ||
+        memcmp(eth_mac, s_no_address, 6) == 0)
+    {
+        ESP_LOGD(TAG, "IF To: %02x:%02x:%02x:%02x:%02x:%02x", eth_mac[0], eth_mac[1],
+                 eth_mac[2], eth_mac[3], eth_mac[4], eth_mac[5]);
+        eth_mac += 6;
+        ESP_LOGD(TAG, "IF From: %02x:%02x:%02x:%02x:%02x:%02x", eth_mac[0], eth_mac[1],
+                 eth_mac[2], eth_mac[3], eth_mac[4], eth_mac[5]);
+        uint8_t *new_buf = malloc(len);
+        memcpy(new_buf, buffer, len);
+        esp_netif_receive(ap_netif, new_buf, len, NULL);
+    }
+}
+
 // Forward packets from Wi-Fi to Ethernet
 static esp_err_t pkt_wifi2eth(void *buffer, uint16_t len, void *eb)
 {
-    if (s_ethernet_is_connected)
-    {
-        if (esp_eth_transmit(s_eth_handle, buffer, len) != ESP_OK)
-        {
+    copy_packet_to_network(buffer, len);
+
+    if (s_ethernet_is_connected) {
+        if (esp_eth_transmit(s_eth_handle, buffer, len) != ESP_OK) {
             ESP_LOGE(TAG, "Ethernet send packet failed");
         }
     }
@@ -67,12 +86,14 @@ static esp_err_t pkt_wifi2eth(void *buffer, uint16_t len, void *eb)
 // so we need to add an extra queue to balance their speed difference.
 static esp_err_t pkt_eth2wifi(esp_eth_handle_t eth_handle, uint8_t *buffer, uint32_t len, void *priv)
 {
+    copy_packet_to_network(buffer, len);
+
     esp_err_t ret = ESP_OK;
     flow_control_msg_t msg = {
         .packet = buffer,
-        .length = len};
-    if (xQueueSend(flow_control_queue, &msg, pdMS_TO_TICKS(FLOW_CONTROL_QUEUE_TIMEOUT_MS)) != pdTRUE)
-    {
+        .length = len
+    };
+    if (xQueueSend(flow_control_queue, &msg, pdMS_TO_TICKS(FLOW_CONTROL_QUEUE_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGE(TAG, "send flow control message failed or timeout");
         free(buffer);
         ret = ESP_FAIL;
@@ -82,41 +103,28 @@ static esp_err_t pkt_eth2wifi(esp_eth_handle_t eth_handle, uint8_t *buffer, uint
 
 // This task will fetch the packet from the queue, and then send out through Wi-Fi.
 // Wi-Fi handles packets slower than Ethernet, we might add some delay between each transmitting.
-
-static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
-                                 int32_t event_id, void *event_data)
-{
-    ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-    const esp_netif_ip_info_t *ip_info = &event->ip_info;
-
-    ESP_LOGI(TAG, "Ethernet Got IP Address");
-    ESP_LOGI(TAG, "~~~~~~~~~~~");
-    ESP_LOGI(TAG, "ETHIP:" IPSTR, IP2STR(&ip_info->ip));
-    ESP_LOGI(TAG, "ETHMASK:" IPSTR, IP2STR(&ip_info->netmask));
-    ESP_LOGI(TAG, "ETHGW:" IPSTR, IP2STR(&ip_info->gw));
-    ESP_LOGI(TAG, "~~~~~~~~~~~");
-}
-
 static void eth2wifi_flow_control_task(void *args)
 {
+    const uint8_t ignore_source[6] = { 0, 0, 0, 0, 0, 0 };
     flow_control_msg_t msg;
     int res = 0;
     uint32_t timeout = 0;
-    while (1)
-    {
-        if (xQueueReceive(flow_control_queue, &msg, pdMS_TO_TICKS(FLOW_CONTROL_QUEUE_TIMEOUT_MS)) == pdTRUE)
-        {
+    while (1) {
+        if (xQueueReceive(flow_control_queue, &msg, pdMS_TO_TICKS(FLOW_CONTROL_QUEUE_TIMEOUT_MS)) == pdTRUE) {
             timeout = 0;
-            if (s_sta_is_connected && msg.length)
-            {
-                do
-                {
+            if (s_sta_is_connected && msg.length) {
+                do {
                     vTaskDelay(pdMS_TO_TICKS(timeout));
                     timeout += 2;
+                    xSemaphoreTake(s_send_mutex, portMAX_DELAY);
                     res = esp_wifi_internal_tx(WIFI_IF_AP, msg.packet, msg.length);
+                    xSemaphoreGive(s_send_mutex);
+                    if (res == ESP_ERR_WIFI_NOT_ASSOC && memcmp(msg.packet, ignore_source, 6) == 0)
+                    {
+                        break;
+                    }
                 } while (res && timeout < FLOW_CONTROL_WIFI_SEND_TIMEOUT_MS);
-                if (res != ESP_OK)
-                {
+                if (res != ESP_OK && res != ESP_ERR_WIFI_NOT_ASSOC) {
                     ESP_LOGE(TAG, "WiFi send packet failed: %d", res);
                 }
             }
@@ -130,8 +138,7 @@ static void eth2wifi_flow_control_task(void *args)
 static void eth_event_handler(void *arg, esp_event_base_t event_base,
                               int32_t event_id, void *event_data)
 {
-    switch (event_id)
-    {
+    switch (event_id) {
     case ETHERNET_EVENT_CONNECTED:
         ESP_LOGI(TAG, "Ethernet Link Up");
         s_ethernet_is_connected = true;
@@ -160,12 +167,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
     static uint8_t s_con_cnt = 0;
-    switch (event_id)
-    {
+    switch (event_id) {
     case WIFI_EVENT_AP_STACONNECTED:
         ESP_LOGI(TAG, "Wi-Fi AP got a station connected");
-        if (!s_con_cnt)
-        {
+        if (!s_con_cnt) {
             s_sta_is_connected = true;
             esp_wifi_internal_reg_rxcb(WIFI_IF_AP, pkt_wifi2eth);
         }
@@ -174,8 +179,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     case WIFI_EVENT_AP_STADISCONNECTED:
         ESP_LOGI(TAG, "Wi-Fi AP got a station disconnected");
         s_con_cnt--;
-        if (!s_con_cnt)
-        {
+        if (!s_con_cnt) {
             s_sta_is_connected = false;
             esp_wifi_internal_reg_rxcb(WIFI_IF_AP, NULL);
         }
@@ -249,29 +253,29 @@ static void initialize_ethernet(void)
 #endif
 #endif // CONFIG_ETH_USE_SPI_ETHERNET
     esp_eth_config_t config = ETH_DEFAULT_CONFIG(mac, phy);
-    esp_eth_config_t config_1 = ETH_DEFAULT_CONFIG(mac, phy);
+ //  esp_eth_config_t config_1 = ETH_DEFAULT_CONFIG(mac, phy);
      config.stack_input = pkt_eth2wifi;
     ESP_ERROR_CHECK(esp_eth_driver_install(&config, &s_eth_handle));
-     ESP_ERROR_CHECK(esp_eth_driver_install(&config_1, &s_eth_handle_1));
+    // ESP_ERROR_CHECK(esp_eth_driver_install(&config_1, &s_eth_handle_1));
 #if !CONFIG_EXAMPLE_USE_INTERNAL_ETHERNET
     /* The SPI Ethernet module might doesn't have a burned factory MAC address, we cat to set it manually.
        02:00:00 is a Locally Administered OUI range so should not be used except when testing on a LAN under your control.
     */
     ESP_ERROR_CHECK(esp_eth_ioctl(s_eth_handle, ETH_CMD_S_MAC_ADDR, (uint8_t[]){0x02, 0x00, 0x00, 0x12, 0x34, 0x56}));
-     ESP_ERROR_CHECK(esp_eth_ioctl(s_eth_handle_1, ETH_CMD_S_MAC_ADDR, (uint8_t[]){0x02, 0x00, 0x00, 0x12, 0x34, 0x59}));
+    // ESP_ERROR_CHECK(esp_eth_ioctl(s_eth_handle_1, ETH_CMD_S_MAC_ADDR, (uint8_t[]){0x02, 0x00, 0x00, 0x12, 0x34, 0x59}));
 #endif
     esp_eth_ioctl(s_eth_handle, ETH_CMD_S_PROMISCUOUS, (void *)true);
-    esp_eth_ioctl(s_eth_handle_1, ETH_CMD_S_PROMISCUOUS, (void *)true);
+   // esp_eth_ioctl(s_eth_handle_1, ETH_CMD_S_PROMISCUOUS, (void *)true);
      esp_eth_start(s_eth_handle);
 
     /**dummmy*/
-    esp_netif_init(); // Initialize TCP/IP network interface (should be called only once in application)
-    esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH(); // apply default network interface configuration for Ethernet
-    esp_netif_t *eth_netif = esp_netif_new(&cfg);     // create network interface for Ethernet driver
+    // esp_netif_init(); // Initialize TCP/IP network interface (should be called only once in application)
+    // esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH(); // apply default network interface configuration for Ethernet
+    // esp_netif_t *eth_netif = esp_netif_new(&cfg);     // create network interface for Ethernet driver
 
-    esp_netif_attach(eth_netif, esp_eth_new_netif_glue(s_eth_handle_1));                   // attach Ethernet driver to TCP/IP stack
-    esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler, NULL); // register user defined IP event handlers
-    esp_eth_start(s_eth_handle_1);                                                            // start Ethernet driver state machine
+    // esp_netif_attach(eth_netif, esp_eth_new_netif_glue(s_eth_handle_1));                   // attach Ethernet driver to TCP/IP stack
+    // esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler, NULL); // register user defined IP event handlers
+    // esp_eth_start(s_eth_handle_1);                                                            // start Ethernet driver state machine
 }
 
 static void initialize_wifi(void)
@@ -290,8 +294,7 @@ static void initialize_wifi(void)
             .channel = CONFIG_EXAMPLE_WIFI_CHANNEL // default: channel 1
         },
     };
-    if (strlen(CONFIG_EXAMPLE_WIFI_PASSWORD) == 0)
-    {
+    if (strlen(CONFIG_EXAMPLE_WIFI_PASSWORD) == 0) {
         wifi_config.ap.authmode = WIFI_AUTH_OPEN;
     }
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
@@ -301,18 +304,40 @@ static void initialize_wifi(void)
 static esp_err_t initialize_flow_control(void)
 {
     flow_control_queue = xQueueCreate(FLOW_CONTROL_QUEUE_LENGTH, sizeof(flow_control_msg_t));
-    if (!flow_control_queue)
-    {
+    if (!flow_control_queue) {
         ESP_LOGE(TAG, "create flow control queue failed");
         return ESP_FAIL;
     }
     BaseType_t ret = xTaskCreate(eth2wifi_flow_control_task, "flow_ctl", 2048, NULL, (tskIDLE_PRIORITY + 2), NULL);
-    if (ret != pdTRUE)
-    {
+    if (ret != pdTRUE) {
         ESP_LOGE(TAG, "create flow control task failed");
         return ESP_FAIL;
     }
-   return ESP_OK;
+    return ESP_OK;
+}
+
+static esp_err_t netif_transmit(void *h, void *buffer, size_t len)
+{
+    xSemaphoreTake(s_send_mutex, portMAX_DELAY);
+    int ret = esp_wifi_internal_tx(WIFI_IF_AP, buffer, len);
+    xSemaphoreGive(s_send_mutex);
+    return ret;
+}
+
+static esp_err_t netif_transmit_wrap(void *h, void *buffer, size_t len, void *netstack_buf)
+{
+    if (s_ethernet_is_connected) {
+        if (esp_eth_transmit(s_eth_handle, buffer, len) != ESP_OK) {
+            ESP_LOGE(TAG, "Ethernet send packet failed");
+        }
+    }
+    return netif_transmit(h, buffer, len);
+}
+
+
+static void l2_free(void *h, void* buffer)
+{
+    free(buffer);
 }
 
 void eth_test()
@@ -336,23 +361,34 @@ void eth_test()
     vTaskDelay(3000 / portTICK_PERIOD_MS);
     }
 }
+
 void app_main(void)
 {
     esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-    gpio_reset_pin(ETH_POWER_PIN);
-    gpio_set_direction(ETH_POWER_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(ETH_POWER_PIN, 1);
-
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(esp_netif_init());
+    s_send_mutex = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(initialize_flow_control());
     initialize_wifi();
     initialize_ethernet();
+    esp_netif_driver_ifconfig_t driver_config = {   .handle =  (void*)1,
+            .transmit = netif_transmit,
+            .transmit_wrap = netif_transmit_wrap,
+            .driver_free_rx_buffer = l2_free };
+
+    esp_netif_config_t cfg =     {
+            .base = ESP_NETIF_BASE_DEFAULT_WIFI_AP,
+            .driver = &driver_config,
+            .stack = ESP_NETIF_NETSTACK_DEFAULT_WIFI_AP,
+    };
+    ap_netif = esp_netif_new(&cfg);
+    esp_netif_action_start(ap_netif, 0, 0, 0);
+
     xTaskCreate(
         eth_test,   /* Function that implements the task. */
         "eth_test", /* Text name for the task. */
@@ -360,4 +396,5 @@ void app_main(void)
         NULL,       /* Parameter passed into the task. */
         3,          /* Priority at which the task is created. */
         NULL);
+
 }
