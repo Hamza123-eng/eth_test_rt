@@ -39,7 +39,7 @@ static esp_netif_t *ap_netif = NULL;
 #define FLOW_CONTROL_QUEUE_LENGTH (40)
 #define FLOW_CONTROL_WIFI_SEND_TIMEOUT_MS (100)
 static SemaphoreHandle_t s_send_mutex = NULL;
-
+#define ETH_POWER_PIN 4
 typedef struct {
     void *packet;
     uint16_t length;
@@ -370,6 +370,9 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+     gpio_reset_pin(ETH_POWER_PIN);
+    gpio_set_direction(ETH_POWER_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level(ETH_POWER_PIN, 1);
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_ERROR_CHECK(esp_netif_init());
     s_send_mutex = xSemaphoreCreateMutex();
